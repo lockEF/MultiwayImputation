@@ -1,0 +1,202 @@
+---
+title: "Bayesian Multiple Imputation for Tensors Tutorial"
+output: html_document
+date: "2024-03-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("Bayesian_Tensor_Imputation_Functions.R")
+library(rTensor)
+library(tensor)
+library(multiway)
+library(MASS)
+library(bayesm)
+library(matrixNormal)
+library(foreach)
+library(parallel)
+library(doParallel)
+library(ggplot2)
+library(abind)
+library("expm")
+library(MCMCpack)
+library(expm)
+library(MBSP)
+library(invgamma)
+library(dae)
+```
+
+
+
+# Illustrative example of Bayesian multiple imputation of Tensor data 
+
+## Generate a three-way tensor with missing elements
+```{r}
+set.seed(12345)
+
+## dimension of the generated tensor
+mydim=c(10,10,10)
+
+## rank of the generated tensor
+nf=3
+
+amat=matrix(rnorm(mydim[1]*nf),nrow = mydim[1],ncol = nf)
+bmat=matrix(rnorm(mydim[2]*nf),nrow = mydim[2],ncol = nf)
+cmat=matrix(rnorm(mydim[3]*nf),nrow = mydim[3],ncol = nf)
+xmat=tcrossprod(amat,krprod(cmat,bmat))
+xmat=array(xmat,dim = mydim)
+
+## generate the covariance matrices of the seperable covariance structure
+
+sigma=vector("list",3)
+sigma[[1]]=(matrix(0.3*ifelse(runif(mydim[1]^2,min = 0,max = 1)<0.5,-1,1),nrow = mydim[1],ncol = mydim[1])+diag(mydim[1])*1.2)*0.5
+sigma[[2]]=(matrix(0.3*ifelse(runif(mydim[2]^2,min = 0,max = 1)<0.5,-1,1),nrow = mydim[2],ncol = mydim[2])+diag(mydim[2])*1.2)*0.5
+sigma[[3]]=(matrix(0.3*ifelse(runif(mydim[3]^2,min = 0,max = 1)<0.5,-1,1),nrow = mydim[3],ncol = mydim[3])+diag(mydim[3])*1.2)*0.5
+
+sigma[[1]][lower.tri(sigma[[1]])]=t(sigma[[1]])[lower.tri(sigma[[1]])]
+sigma[[2]][lower.tri(sigma[[2]])]=t(sigma[[2]])[lower.tri(sigma[[2]])]
+sigma[[3]][lower.tri(sigma[[3]])]=t(sigma[[3]])[lower.tri(sigma[[3]])]
+
+sigma[[1]]=diag(mydim[1])*0.5
+sigma[[2]]=t(sigma[[2]])%*%sigma[[2]]
+sigma[[3]]=t(sigma[[3]])%*%sigma[[3]]
+
+U_mat=sigma[[1]]
+V_mat=kronecker_list(rev(sigma[-1]))
+error_matrix=matrix_normal(M=matrix(0,nrow = mydim[1],ncol = mydim[2]*mydim[3]),U=sigma[[1]],V=kronecker_list(rev(sigma[-1])))
+emat=foldimp(error_matrix,mode = 1,dims = mydim)
+
+## x be our generated tensor object with error term has seperable covariance structure
+x=xmat+emat
+
+## orx be the true underlying structure of rank 3
+orx=xmat
+
+
+## the following set random/fiber missing to the tensor
+
+fiber=TRUE
+
+dims=dim(x)
+N=length(dims)
+M=prod(dims)
+mis=x ## indicator of whether the element is missing or observed
+
+## y be the observed tensor with missing elements
+y=x
+
+mis_prop=0.3
+
+  
+if(fiber){
+  for(ii in 1:dims[1]){
+    for(ij in 1:dims[3]){
+      u=runif(1)
+      if(u<=mis_prop){
+        y[ii,,ij]="NA"
+        mis[ii,,ij]=1
+      }else{
+        mis[ii,,ij]=0 
+      }
+    }
+  }
+}else{
+  for(e in 1:M){
+    u=runif(1)
+    if(u<=mis_prop){
+      y[e]="NA"
+      mis[e]=1
+    }else{
+      mis[e]=0
+    }
+  }
+}
+
+
+
+```
+
+
+## Bayesian multiple imputation of tensor data assume the i.i.d. error
+
+
+```{r}
+set.seed(12345)
+numc=3
+max=5000
+burnin=2000
+thin=1
+m_iter=(max-burnin)/thin
+
+## Call our Bayesian multiple imputation function with i.i.d. error
+
+
+##########################################################################################
+####      
+####             Bayesian multiple tensor imputation method with i.i.d error 
+####      Generate the posterior samples of the underlying structure X1 X2 X3... of the decomposition with standard error \sigma
+####      Users can reconstruct the imputated tensor with [[X1,X2,X3...]]+N(0,\sigma^2)
+####      ts: observed tensor with missing elements
+####      num_com: rank of the tensor decomposition (number of rank 1 tensor components)
+####      max: max MCMC iteration 
+####      burn.in: burnin value for the posterior samples
+####      initial: particular initial value for the Bayes sampling
+####      cpem_as_initial: whether use frequentist cp decomposition result as initial value
+####      thin: thin value for the posterior samples, thin = k means only keep the 1/k posterior samples as result
+####      
+##########################################################################################
+t1=cpbayeimp_Jef_check_effi(y,num_com = numc,max =max,burn.in = burnin,thin=thin)
+
+
+
+## Reconstruct the imputed tensor using the output
+
+t1_resu=array(0,dim = c(m_iter,mydim))
+for(ii in 1:m_iter){
+  t1_error=rnorm(prod(mydim),mean = 0,sd=sqrt(t1$sigma_err[ii]))
+  u_est=vector("list",3)
+  u_est[[1]]=t1$resu1[ii,,]
+  u_est[[2]]=t1$resu2[ii,,]
+  u_est[[3]]=t1$resu3[ii,,]
+  t1_resu[ii,,,]=outerimp(u_est)
+  t1_resu[ii,,,]=t1_resu[ii,,,]+t1_error*mis
+}
+
+## impute the missing value as the mean of the posterior samples
+t1_esti=apply(t1_resu,c(2,3,4),mean)
+
+## mean squired error
+sum((x*mis-t1_esti*mis)^2)/sum((x*mis)^2)
+
+## coverage rate
+CCofBayes(x,t1_resu,mis = mis,alpha = 0.95)
+
+        
+```
+
+
+
+## Bayesian multiple imputation of tensor data assume the seperable covariance structure
+
+
+```{r}
+set.seed(12345)
+max_numc=5
+max=1000
+burnin=200
+thin=1
+
+t2=cpbaye_covariance_appli_mix2_fiber_5(y,num_com = numc,max =max,burn.in = burnin,thin=thin,fiber_mis = 2,identi = 1,cpem_as_initial = TRUE,show_progress = TRUE)
+
+## impute the missing value as the mean of the posterior samples
+t2_esti=apply(t2$resu,c(2,3,4),mean)
+    
+## mean squired error    
+sum((x*mis-t2_esti*mis)^2)/sum((x*mis)^2)
+
+## coverage rate
+CCofBayes(x,t2$resu,mis = mis,alpha = 0.95)
+
+
+```
+
